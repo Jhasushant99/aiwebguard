@@ -1,0 +1,129 @@
+import torch
+import json
+import cv2
+from PIL import Image
+from transformers import AutoProcessor, AutoModelForVision2Seq
+
+# ===== CONFIG =====
+MODEL_PATH = "./models/Qwen3.5-VL"
+IMAGE_PATH = "./images/test.jpg"
+
+OUTPUT_IMAGE = "./output_marked.jpg"
+OUTPUT_JSON = "./output.json"
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+
+
+processor = AutoProcessor.from_pretrained(MODEL_PATH)
+
+model = AutoModelForVision2Seq.from_pretrained(
+    MODEL_PATH,
+    torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32,
+    device_map="auto"
+)
+
+model.eval()
+
+
+image_pil = Image.open(IMAGE_PATH).convert("RGB")
+image_cv = cv2.imread(IMAGE_PATH)
+
+height, width, _ = image_cv.shape
+
+
+prompt = """
+You are a strict AI WebGuard system.
+
+Analyze the image and detect:
+- NSFW content
+- Violence or weapons
+- Hate or offensive symbols
+- Suspicious/illegal activity
+
+Return STRICT JSON ONLY:
+{
+ "category": "Safe | NSFW | Violence | Hate | Suspicious",
+ "reason": "short reason",
+ "confidence": "0-100%",
+ "location": "top-left | top-right | center | bottom-left | bottom-right"
+}
+"""
+
+
+inputs = processor(
+    text=prompt,
+    images=image_pil,
+    return_tensors="pt"
+).to(DEVICE)
+
+# ===== INFERENCE =====
+print("[INFO] Running inference...")
+
+with torch.no_grad():
+    output = model.generate(
+        **inputs,
+        max_new_tokens=150,
+        do_sample=False
+    )
+
+result = processor.batch_decode(output, skip_special_tokens=True)[0]
+
+print("[RAW OUTPUT]\n", result)
+
+
+def extract_json(text):
+    try:
+        start = text.index("{")
+        end = text.rindex("}") + 1
+        return json.loads(text[start:end])
+    except:
+        return None
+
+parsed = extract_json(result)
+
+if parsed is None:
+    parsed = {
+        "category": "Unknown",
+        "reason": "Model output parsing failed",
+        "confidence": "0%",
+        "location": "center"
+    }
+
+
+def get_box(location):
+    location = location.lower()
+
+    if "top" in location:
+        y1, y2 = 0, height // 2
+    else:
+        y1, y2 = height // 2, height
+
+    if "left" in location:
+        x1, x2 = 0, width // 2
+    elif "right" in location:
+        x1, x2 = width // 2, width
+    else:
+        x1, x2 = width // 4, 3 * width // 4
+
+    return x1, y1, x2, y2
+
+
+if parsed["category"].lower() != "safe":
+    x1, y1, x2, y2 = get_box(parsed["location"])
+
+    cv2.rectangle(image_cv, (x1, y1), (x2, y2), (0, 0, 255), 3)
+
+    label = f"{parsed['category']} ({parsed['confidence']})"
+    cv2.putText(image_cv, label, (x1, y1 - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+cv2.imwrite(OUTPUT_IMAGE, image_cv)
+
+with open(OUTPUT_JSON, "w") as f:
+    json.dump(parsed, f, indent=4)
+
+
+print("Saved Image:", OUTPUT_IMAGE)
+print("Saved JSON:", OUTPUT_JSON)
